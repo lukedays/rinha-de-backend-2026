@@ -1,0 +1,64 @@
+name: rinha-fraud
+
+x-api: &api
+  image: ghcr.io/lukedays/rinha-fraud:latest
+  entrypoint: ["/rinha-server"]
+  volumes:
+    - sockets:/sockets
+  networks:
+    - app
+  ulimits:
+    memlock: -1
+  deploy:
+    resources:
+      limits:
+        cpus: "0.47"
+        memory: "170MB"
+
+services:
+  api1:
+    <<: *api
+    cpuset: "0"
+    environment:
+      WORKERS: "1"
+      RINHA_C_BUSY_POLL_US: "50"
+      RINHA_SOCKET: /sockets/api1.sock
+
+  api2:
+    <<: *api
+    cpuset: "1"
+    depends_on:
+      - api1
+    environment:
+      WORKERS: "1"
+      RINHA_C_BUSY_POLL_US: "50"
+      RINHA_SOCKET: /sockets/api2.sock
+
+  lb:
+    image: ghcr.io/lukedays/rinha-fraud:latest
+    entrypoint: ["/rinha-lb"]
+    cpuset: "2,3"
+    depends_on:
+      - api1
+      - api2
+    environment:
+      PORT: "9999"
+      RINHA_BACKENDS: "/sockets/api1.sock.0,/sockets/api2.sock.0"
+    volumes:
+      - sockets:/sockets
+    ports:
+      - "9999:9999"
+    networks:
+      - app
+    deploy:
+      resources:
+        limits:
+          cpus: "0.06"
+          memory: "10MB"
+
+volumes:
+  sockets:
+
+networks:
+  app:
+    driver: bridge

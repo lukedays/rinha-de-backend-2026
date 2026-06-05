@@ -1,0 +1,10 @@
+_ref
+data
+test
+**/*.o
+c/rinha-server
+c/rinha-lb
+c/selftest
+c/bench
+c/build_index
+.git

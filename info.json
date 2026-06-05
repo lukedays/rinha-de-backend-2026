@@ -1,0 +1,7 @@
+{
+    "participants": ["Lucas"],
+    "social": ["https://github.com/lukedays"],
+    "source-code-repo": "https://github.com/lukedays/rinha-de-backend-2026",
+    "stack": ["c", "asm", "avx2"],
+    "open_to_work": false
+}
