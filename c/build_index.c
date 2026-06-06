@@ -139,10 +139,105 @@ static int nearest(const int16_t *p, const float *cen, int k) {
     return best;
 }
 
+// ===================== KD-tree (alternativa a IVF) =====================
+// Particao binaria do espaco; leaves escaneadas com o mesmo kernel AVX2 8-lanes.
+// No: interno (dim/split + filhos esq/dir) ou leaf (range de chunks + vetores).
+typedef struct { uint8_t leaf, dim; int16_t split; int32_t a, b, c; int16_t bmin[16], bmax[16]; } kdnode;
+// interno: a=esq, b=dir (indice de no)        leaf: a=chunk_start, b=count, c=vec_start
+// bmin/bmax: AABB do subtree (lower bound admissivel) -> poda bounding-box exata.
+
+static kdnode *kd_nodes; static int kd_n, kd_cap;
+static const int16_t *kd_src;   // dados originais N*DIM
+static const uint8_t *kd_srclab;
+static int *kd_perm;            // permutacao em construcao
+static int16_t *kd_outch; static uint8_t *kd_outlab;
+static int kd_chpos, kd_vpos, kd_leaf, kd_sort_dim;
+
+static int kd_alloc(void) {
+    if (kd_n >= kd_cap) { kd_cap = kd_cap ? kd_cap * 2 : 1024; kd_nodes = realloc(kd_nodes, (size_t)kd_cap * sizeof(kdnode)); }
+    return kd_n++;
+}
+static int kd_cmp(const void *A, const void *B) {
+    int ia = *(const int *)A, ib = *(const int *)B;
+    int16_t va = kd_src[(size_t)ia * DIM + kd_sort_dim], vb = kd_src[(size_t)ib * DIM + kd_sort_dim];
+    return (va > vb) - (va < vb);
+}
+static int kd_emit_leaf(int lo, int hi) {
+    int id = kd_alloc(); kdnode *nd = &kd_nodes[id];
+    int sz = hi - lo, nch = (sz + 7) / 8;
+    nd->leaf = 1; nd->dim = 0; nd->split = 0; nd->a = kd_chpos; nd->b = sz; nd->c = kd_vpos;
+    for (int ch = 0; ch < nch; ch++) {
+        int16_t *dst = kd_outch + (size_t)(kd_chpos + ch) * 112;
+        for (int lane = 0; lane < 8; lane++) {
+            int vi = ch * 8 + lane; if (vi >= sz) vi = sz - 1;
+            const int16_t *v = kd_src + (size_t)kd_perm[lo + vi] * DIM;
+            for (int p = 0; p < 7; p++) { dst[p * 16 + lane * 2] = v[2 * p]; dst[p * 16 + lane * 2 + 1] = v[2 * p + 1]; }
+        }
+    }
+    for (int j = 0; j < sz; j++) kd_outlab[kd_vpos + j] = kd_srclab[kd_perm[lo + j]];
+    kd_chpos += nch; kd_vpos += sz;
+    return id;
+}
+static int kd_build(int lo, int hi) {
+    int cnt = hi - lo;
+    // AABB do subtree (todas as dims) -> usado p/ a dim de maior range e p/ poda.
+    int16_t bmn[16], bmx[16];
+    for (int d = 0; d < 16; d++) { bmn[d] = 32767; bmx[d] = -32768; }
+    for (int i = lo; i < hi; i++) {
+        const int16_t *v = kd_src + (size_t)kd_perm[i] * DIM;
+        for (int d = 0; d < DIM; d++) { if (v[d] < bmn[d]) bmn[d] = v[d]; if (v[d] > bmx[d]) bmx[d] = v[d]; }
+    }
+    bmn[14] = bmn[15] = 0; bmx[14] = bmx[15] = 0;
+
+    int id;
+    if (cnt <= kd_leaf) {
+        id = kd_emit_leaf(lo, hi);
+    } else {
+        int bestd = 0, bestr = -1;
+        for (int d = 0; d < DIM; d++) { int r = bmx[d] - bmn[d]; if (r > bestr) { bestr = r; bestd = d; } }
+        kd_sort_dim = bestd;
+        qsort(kd_perm + lo, (size_t)cnt, sizeof(int), kd_cmp);
+        int mid = lo + cnt / 2;
+        int16_t split = kd_src[(size_t)kd_perm[mid] * DIM + bestd];
+        id = kd_alloc();
+        int L = kd_build(lo, mid), R = kd_build(mid, hi);
+        kd_nodes[id].leaf = 0; kd_nodes[id].dim = (uint8_t)bestd; kd_nodes[id].split = split;
+        kd_nodes[id].a = L; kd_nodes[id].b = R;
+    }
+    memcpy(kd_nodes[id].bmin, bmn, 16 * sizeof(int16_t));
+    memcpy(kd_nodes[id].bmax, bmx, 16 * sizeof(int16_t));
+    return id;
+}
+
+static int build_kdtree(const int16_t *data, const uint8_t *lab, int n, int leaf, const char *out) {
+    kd_src = data; kd_srclab = lab; kd_leaf = leaf;
+    kd_perm = malloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) kd_perm[i] = i;
+    int max_chunks = (n + 7) / 8 + n / leaf + 16;       // teto folgado
+    kd_outch = calloc((size_t)max_chunks * 112, sizeof(int16_t));
+    kd_outlab = malloc((size_t)n);
+    kd_chpos = kd_vpos = kd_n = 0; kd_cap = 0; kd_nodes = NULL;
+    double t = now();
+    int root = kd_build(0, n);
+    fprintf(stderr, "kd-tree: %d nos, %d chunks, leaf=%d (%.1fs)\n", kd_n, kd_chpos, leaf, now() - t);
+    FILE *f = fopen(out, "wb");
+    uint32_t magic = 0x34484E52u; int dim = DIM;        // "RNH4"
+    fwrite(&magic, 4, 1, f); fwrite(&n, 4, 1, f); fwrite(&dim, 4, 1, f);
+    fwrite(&kd_n, 4, 1, f); fwrite(&kd_chpos, 4, 1, f); fwrite(&root, 4, 1, f);
+    fwrite(kd_nodes, sizeof(kdnode), (size_t)kd_n, f);
+    fwrite(kd_outlab, 1, (size_t)n, f);
+    fwrite(kd_outch, sizeof(int16_t), (size_t)kd_chpos * 112, f);
+    fclose(f);
+    fprintf(stderr, "salvo %s (KD N=%d nos=%d chunks=%d)\n", out, n, kd_n, kd_chpos);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "uso: build_index <references.json.gz> <out.bin> [K=2048] [iters=12]\n"); return 1; }
-    int K = argc > 3 ? atoi(argv[3]) : 2048;
+    if (argc < 3) { fprintf(stderr, "uso: build_index <references.json.gz> <out.bin> [K=2048|kd] [iters=12|leaf]\n"); return 1; }
+    int kd_mode = (argc > 3 && strcmp(argv[3], "kd") == 0);
+    int K = (!kd_mode && argc > 3) ? atoi(argv[3]) : 2048;
     int iters = argc > 4 ? atoi(argv[4]) : 12;
+    int leaf = (kd_mode && argc > 4) ? atoi(argv[4]) : 256;
 
     double t = now();
     size_t blen;
@@ -154,6 +249,8 @@ int main(int argc, char **argv) {
     int n = parse_refs(raw, blen, &data, &lab);
     free(raw);
     fprintf(stderr, "parse: %d vetores (%.1fs)\n", n, now() - t);
+
+    if (kd_mode) { build_kdtree(data, lab, n, leaf, argv[2]); return 0; }
 
     t = now();
     float *cen = kmeans(data, n, K, iters, 42);

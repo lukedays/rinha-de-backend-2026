@@ -233,8 +233,68 @@ finish:
     return bl[0] + bl[1] + bl[2] + bl[3] + bl[4];
 }
 
-// Producao: usa 2 niveis quando o filtro grosseiro foi construido; senao 1 nivel.
+// ===================== KD-tree (reescrita da abordagem do #1 em C+ASM) =====================
+// Traversal exato com poda por plano de corte: na subarvore "longe" todo ponto
+// tem coord[dim] do lado oposto ao split, logo dist^2 >= (q[dim]-split)^2; se isso
+// >= worst, poda. Leaves escaneadas com o mesmo kernel AVX2 8-lanes (dist_chunks_i16).
+typedef struct {
+    const index_t *ix;
+    const int32_t *qpairs;
+    const int16_t *q16;
+    int32_t *scratch;
+    __m256i vq, m14;
+    int32_t bd[5];
+    uint8_t bl[5];
+    int32_t worst;
+    int worst_pos;
+    long visited, scanned;
+} kdctx;
+
+static void kd_leaf(kdctx *s, const kdnode *nd) {
+    int sz = nd->b, nch = (sz + 7) / 8;
+    dist_chunks_i16(s->qpairs, s->ix->chunks + (size_t)nd->a * 112, nch, s->scratch);
+    const uint8_t *lab = s->ix->labels + nd->c;
+    s->visited++; s->scanned += sz;
+    int32_t worst = s->worst, *bd = s->bd; int wp = s->worst_pos; uint8_t *bl = s->bl;
+    for (int j = 0; j < sz; j++) {
+        int32_t d = s->scratch[j];
+        if (d >= worst) continue;
+        bd[wp] = d; bl[wp] = lab[j];
+        worst = bd[0]; wp = 0;
+        for (int t = 1; t < 5; t++) if (bd[t] > worst) { worst = bd[t]; wp = t; }
+    }
+    s->worst = worst; s->worst_pos = wp;
+}
+
+static void kd_recurse(kdctx *s, int node) {
+    const kdnode *nd = &s->ix->nodes[node];
+    // Poda por bounding-box: o AABB-LB do subtree e um lower bound admissivel p/
+    // todos os seus vetores. Se >= worst, nenhum pode entrar no top-5 -> poda tudo.
+    if (aabb_lb_avx2(nd->bmin, nd->bmax, s->vq, s->m14) >= s->worst) return;
+    if (nd->leaf) { kd_leaf(s, nd); return; }
+    int diff = (int)s->q16[nd->dim] - (int)nd->split;
+    int near, far;
+    if (diff <= 0) { near = nd->a; far = nd->b; } else { near = nd->b; far = nd->a; }
+    kd_recurse(s, near);   // mais proximo primeiro (worst encolhe), depois o outro
+    kd_recurse(s, far);
+}
+
+static int search_kd(const index_t *ix, const int16_t q16[16], int32_t *scratch) {
+    int32_t qpairs[7];
+    load_qpairs(q16, qpairs);
+    kdctx s = { .ix = ix, .qpairs = qpairs, .q16 = q16, .scratch = scratch,
+                .vq = _mm256_loadu_si256((const __m256i *)q16),
+                .m14 = _mm256_loadu_si256((const __m256i *)MASK14),
+                .bd = { INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX },
+                .bl = { 0, 0, 0, 0, 0 }, .worst = INT32_MAX, .worst_pos = 0, .visited = 0, .scanned = 0 };
+    kd_recurse(&s, ix->kd_root);
+    g_clusters_visited = s.visited; g_vectors_scanned = s.scanned;
+    return s.bl[0] + s.bl[1] + s.bl[2] + s.bl[3] + s.bl[4];
+}
+
+// Producao: KD-tree se o indice for "RNH4"; senao IVF (2 niveis, ou 1 nivel).
 int fraud_count(const index_t *ix, const int16_t q16[16], int32_t *scratch) {
+    if (ix->is_kd) return search_kd(ix, q16, scratch);
     if (ix->n_super > 0 && ix->n_super <= MAX_SUPER)
         return search_two(ix, q16, scratch);
     return search_single(ix, q16, scratch);

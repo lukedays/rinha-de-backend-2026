@@ -90,6 +90,7 @@ static void build_superclusters(index_t *ix) {
 
 // "RNH3" (bytes 0x52,0x4E,0x48,0x33) => 0x33484E52 como u32 little-endian.
 #define MAGIC3 0x33484E52u
+#define MAGIC4 0x34484E52u  // "RNH4": KD-tree
 
 static uint32_t rd_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -110,6 +111,25 @@ int index_load(const char *path, index_t *ix) {
     mlock(map, len); // best-effort (precisa de ulimit memlock); ignora falha
 
     const uint8_t *b = (const uint8_t *)map;
+    ix->is_kd = 0; ix->n_super = 0;
+    ix->super_min = NULL; ix->super_max = NULL; ix->super_off = NULL; ix->super_mem = NULL;
+    ix->map = map; ix->map_len = len;
+
+    if (rd_u32(b) == MAGIC4) {  // KD-tree
+        int n = rd_i32(b + 4), dim = rd_i32(b + 8), n_nodes = rd_i32(b + 12);
+        int total_chunks = rd_i32(b + 16), root = rd_i32(b + 20);
+        if (dim != DIM) { fprintf(stderr, "dim=%d inesperado\n", dim); munmap(map, len); return -1; }
+        size_t o = 24;
+        ix->nodes = (const kdnode *)(b + o); o += (size_t)n_nodes * sizeof(kdnode);
+        ix->labels = b + o;                  o += (size_t)n;
+        ix->chunks = (const int16_t *)(b + o);
+        ix->n = n; ix->is_kd = 1; ix->n_nodes = n_nodes; ix->total_chunks = total_chunks; ix->kd_root = root;
+        int maxc = 0;
+        for (int i = 0; i < n_nodes; i++) if (ix->nodes[i].leaf && ix->nodes[i].b > maxc) maxc = ix->nodes[i].b;
+        ix->max_lanes = ((maxc + 7) / 8) * 8;
+        return 0;
+    }
+
     if (rd_u32(b) != MAGIC3) { fprintf(stderr, "magic invalido: %08x\n", rd_u32(b)); munmap(map, len); return -1; }
     int n = rd_i32(b + 4);
     int dim = rd_i32(b + 8);

@@ -69,26 +69,41 @@ int main(int argc, char **argv) {
     int32_t *scratch = malloc((size_t)ix.max_lanes * sizeof(int32_t));
     for (int i = 0; i < 2000; i++) fraud_count(&ix, queries + (size_t)(i % Q) * 16, scratch);
 
-    // Validacao: o grader pontua a DECISAO approved=(nf<THRESHOLD), nao o nf exato.
-    // (1) decisao 2niv vs 1niv em todas as queries; (2) decisao 2niv vs brute force
-    // exato num subconjunto (caro, ~3M/query). nf-mismatch e benigno (chromatic).
-    long nf_mism = 0, dec_mism = 0, brute_dec_mism = 0;
-    for (int i = 0; i < Q; i++) {
-        const int16_t *q = queries + (size_t)i * 16;
-        int a = fraud_count(&ix, q, scratch);
-        int b = fraud_count_single(&ix, q, scratch);
-        if (a != b) nf_mism++;
-        if ((a < THRESHOLD_FRAUDS) != (b < THRESHOLD_FRAUDS)) dec_mism++;
+    // Validacao de exatidao. Se um indice de REFERENCIA for passado (argv[4]),
+    // compara fraud_count(test) vs fraud_count(ref) nas mesmas queries — formato-
+    // agnostico (valida o KD contra a IVF ja validada exata). Senao, paridade IVF.
+    if (argc > 4) {
+        index_t ref;
+        if (index_load(argv[4], &ref) != 0) return 1;
+        int32_t *scrr = malloc(((size_t)ref.max_lanes + 8) * sizeof(int32_t));
+        long nf_mism = 0, dec_mism = 0;
+        for (int i = 0; i < Q; i++) {
+            const int16_t *q = queries + (size_t)i * 16;
+            int a = fraud_count(&ix, q, scratch);
+            int b = fraud_count(&ref, q, scrr);
+            if (a != b) nf_mism++;
+            if ((a < THRESHOLD_FRAUDS) != (b < THRESHOLD_FRAUDS)) dec_mism++;
+        }
+        printf("  vs REF (%s): nf-mism=%ld | DECISAO-mism=%ld / %d\n", argv[4], nf_mism, dec_mism, Q);
+    } else if (!ix.is_kd) {
+        long nf_mism = 0, dec_mism = 0, brute_dec_mism = 0;
+        for (int i = 0; i < Q; i++) {
+            const int16_t *q = queries + (size_t)i * 16;
+            int a = fraud_count(&ix, q, scratch);
+            int b = fraud_count_single(&ix, q, scratch);
+            if (a != b) nf_mism++;
+            if ((a < THRESHOLD_FRAUDS) != (b < THRESHOLD_FRAUDS)) dec_mism++;
+        }
+        int nb = Q < 4000 ? Q : 4000;
+        for (int i = 0; i < nb; i++) {
+            const int16_t *q = queries + (size_t)i * 16;
+            int a = fraud_count(&ix, q, scratch);
+            int bf = brute_force(&ix, q);
+            if ((a < THRESHOLD_FRAUDS) != (bf < THRESHOLD_FRAUDS)) brute_dec_mism++;
+        }
+        printf("  paridade nf(2v-1v)=%ld | DECISAO(2v-1v)=%ld/%d | DECISAO(2v-brute)=%ld/%d\n",
+               nf_mism, dec_mism, Q, brute_dec_mism, nb);
     }
-    int nb = Q < 4000 ? Q : 4000;
-    for (int i = 0; i < nb; i++) {
-        const int16_t *q = queries + (size_t)i * 16;
-        int a = fraud_count(&ix, q, scratch);
-        int bf = brute_force(&ix, q);
-        if ((a < THRESHOLD_FRAUDS) != (bf < THRESHOLD_FRAUDS)) brute_dec_mism++;
-    }
-    printf("  paridade nf(2v-1v)=%ld | DECISAO(2v-1v)=%ld/%d | DECISAO(2v-brute)=%ld/%d\n",
-           nf_mism, dec_mism, Q, brute_dec_mism, nb);
 
     double *lat = malloc((size_t)Q * sizeof(double));
     long sum_cl = 0, sum_vec = 0;
