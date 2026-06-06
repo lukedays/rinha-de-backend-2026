@@ -107,6 +107,7 @@ int index_load(const char *path, index_t *ix) {
     if (map == MAP_FAILED) { perror("mmap"); return -1; }
     // mantem o indice quente na RAM: sem page-fault na cauda de latencia.
     madvise(map, len, MADV_WILLNEED);
+    madvise(map, len, MADV_HUGEPAGE); // Haswell: huge pages no indice de 87MB -> menos TLB miss
     mlock(map, len); // best-effort (precisa de ulimit memlock); ignora falha
 
     const uint8_t *b = (const uint8_t *)map;

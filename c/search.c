@@ -183,6 +183,9 @@ static int search_two(const index_t *ix, const int16_t q16[16], int32_t *scratch
         int lo = soff[s], hi = soff[s + 1], cn = 0;
         for (int m = lo; m < hi; m++) {
             int c = smem[m];
+            // Haswell (cache-miss-bound, L3 3MB): prefetch do AABB do proximo membro
+            // — os ids sao espalhados, entao esconder a latencia do miss compensa.
+            if (m + 1 < hi) { int nc = smem[m + 1]; __builtin_prefetch(amn + (size_t)nc * DIM, 0, 1); __builtin_prefetch(amx + (size_t)nc * DIM, 0, 1); }
             int32_t lb = aabb_lb_avx2(amn + (size_t)c * DIM, amx + (size_t)c * DIM, vq, m14);
             if (lb >= worst) continue;
             int pos = cn++;
@@ -213,6 +216,14 @@ static int search_two(const index_t *ix, const int16_t q16[16], int32_t *scratch
             int nch = ix->chunk_offsets[best_c + 1] - cstart;
             visited++; scanned += size;
 
+            // Haswell: prefetch dos chunks do PROXIMO cluster a visitar enquanto o
+            // kernel escaneia o atual — esconde o miss da proxima regiao espalhada.
+            if (i + 1 < cn) {
+                int nc = mids[i + 1];
+                const int16_t *np = chunks + (size_t)ix->chunk_offsets[nc] * 112;
+                __builtin_prefetch(np, 0, 1);
+                __builtin_prefetch(np + 64, 0, 1);
+            }
             dist_chunks_i16(qpairs, chunks + (size_t)cstart * 112, nch, scratch);
 
             const uint8_t *lab = labels + vstart;

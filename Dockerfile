@@ -9,7 +9,7 @@ WORKDIR /src
 COPY c/ ./
 RUN make clean >/dev/null 2>&1; \
     make rinha-server rinha-lb build_index \
-      CFLAGS="-O3 -march=x86-64-v3 -mavx2 -mfma -flto -fno-plt -Wall" \
+      CFLAGS="-O3 -march=haswell -mtune=haswell -mavx2 -mfma -flto -fno-plt -Wall" \
       LDFLAGS="-O3 -flto -static -pthread"
 
 # gera o indice de forma reprodutivel (seed fixa) a partir do dataset oficial
