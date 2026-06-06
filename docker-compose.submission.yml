@@ -21,7 +21,8 @@ services:
     cpuset: "0"
     environment:
       WORKERS: "1"
-      RINHA_C_BUSY_POLL_US: "50"
+      RINHA_C_BUSY_POLL_US: "100"
+      RINHA_C_EPOLL_IDLE_US: "400"
       RINHA_SOCKET: /sockets/api1.sock
 
   api2:
@@ -31,7 +32,8 @@ services:
       - api1
     environment:
       WORKERS: "1"
-      RINHA_C_BUSY_POLL_US: "50"
+      RINHA_C_BUSY_POLL_US: "100"
+      RINHA_C_EPOLL_IDLE_US: "400"
       RINHA_SOCKET: /sockets/api2.sock
 
   lb:

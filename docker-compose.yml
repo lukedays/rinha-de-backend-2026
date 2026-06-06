@@ -27,7 +27,8 @@ services:
     cpuset: "0"
     environment:
       WORKERS: "${WORKERS:-1}"
-      RINHA_C_BUSY_POLL_US: "${BUSY_POLL:-50}"
+      RINHA_C_BUSY_POLL_US: "${BUSY_POLL:-100}"
+      RINHA_C_EPOLL_IDLE_US: "${EPOLL_IDLE:-400}"
       RINHA_SOCKET: /sockets/api1.sock
 
   api2:
@@ -37,7 +38,8 @@ services:
       - api1
     environment:
       WORKERS: "${WORKERS:-1}"
-      RINHA_C_BUSY_POLL_US: "${BUSY_POLL:-50}"
+      RINHA_C_BUSY_POLL_US: "${BUSY_POLL:-100}"
+      RINHA_C_EPOLL_IDLE_US: "${EPOLL_IDLE:-400}"
       RINHA_SOCKET: /sockets/api2.sock
 
   lb:

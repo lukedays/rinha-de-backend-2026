@@ -22,6 +22,27 @@ static void unpack(const int16_t *chunks, int chunk, int lane, int16_t v[DIM]) {
     for (int p = 0; p < 7; p++) { v[2 * p] = c[p * 16 + lane * 2]; v[2 * p + 1] = c[p * 16 + lane * 2 + 1]; }
 }
 
+// Brute force escalar exato (gabarito independente do asm/busca).
+static int brute_force(const index_t *ix, const int16_t q[16]) {
+    int bd[5] = { 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff };
+    uint8_t bl[5] = { 0, 0, 0, 0, 0 };
+    int worst = 0x7fffffff, wp = 0;
+    for (int c = 0; c < ix->k; c++) {
+        int vstart = ix->offsets[c], size = ix->offsets[c + 1] - vstart, cstart = ix->chunk_offsets[c];
+        for (int j = 0; j < size; j++) {
+            int16_t v[DIM];
+            unpack(ix->chunks, cstart + j / 8, j % 8, v);
+            int dist = 0;
+            for (int d = 0; d < DIM; d++) { int df = v[d] - q[d]; dist += df * df; }
+            if (dist >= worst) continue;
+            bd[wp] = dist; bl[wp] = ix->labels[vstart + j];
+            worst = bd[0]; wp = 0;
+            for (int t = 1; t < 5; t++) if (bd[t] > worst) { worst = bd[t]; wp = t; }
+        }
+    }
+    return bl[0] + bl[1] + bl[2] + bl[3] + bl[4];
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "uso: bench <index.bin> [queries=20000] [noise=30]\n"); return 1; }
     int Q = argc > 2 ? atoi(argv[2]) : 20000;
@@ -47,6 +68,27 @@ int main(int argc, char **argv) {
 
     int32_t *scratch = malloc((size_t)ix.max_lanes * sizeof(int32_t));
     for (int i = 0; i < 2000; i++) fraud_count(&ix, queries + (size_t)(i % Q) * 16, scratch);
+
+    // Validacao: o grader pontua a DECISAO approved=(nf<THRESHOLD), nao o nf exato.
+    // (1) decisao 2niv vs 1niv em todas as queries; (2) decisao 2niv vs brute force
+    // exato num subconjunto (caro, ~3M/query). nf-mismatch e benigno (chromatic).
+    long nf_mism = 0, dec_mism = 0, brute_dec_mism = 0;
+    for (int i = 0; i < Q; i++) {
+        const int16_t *q = queries + (size_t)i * 16;
+        int a = fraud_count(&ix, q, scratch);
+        int b = fraud_count_single(&ix, q, scratch);
+        if (a != b) nf_mism++;
+        if ((a < THRESHOLD_FRAUDS) != (b < THRESHOLD_FRAUDS)) dec_mism++;
+    }
+    int nb = Q < 4000 ? Q : 4000;
+    for (int i = 0; i < nb; i++) {
+        const int16_t *q = queries + (size_t)i * 16;
+        int a = fraud_count(&ix, q, scratch);
+        int bf = brute_force(&ix, q);
+        if ((a < THRESHOLD_FRAUDS) != (bf < THRESHOLD_FRAUDS)) brute_dec_mism++;
+    }
+    printf("  paridade nf(2v-1v)=%ld | DECISAO(2v-1v)=%ld/%d | DECISAO(2v-brute)=%ld/%d\n",
+           nf_mism, dec_mism, Q, brute_dec_mism, nb);
 
     double *lat = malloc((size_t)Q * sizeof(double));
     long sum_cl = 0, sum_vec = 0;

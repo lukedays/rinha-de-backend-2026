@@ -15,7 +15,7 @@ RUN make clean >/dev/null 2>&1; \
 # gera o indice de forma reprodutivel (seed fixa) a partir do dataset oficial
 ARG REFS_URL=https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz
 RUN curl -fsSL "$REFS_URL" -o /tmp/refs.json.gz \
-    && ./build_index /tmp/refs.json.gz /index.bin 2048 12 \
+    && ./build_index /tmp/refs.json.gz /index.bin 8192 12 \
     && rm /tmp/refs.json.gz
 
 # ---- runtime: scratch (binarios estaticos + indice) ----

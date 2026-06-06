@@ -14,8 +14,10 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 // epoll busy-poll (glibc < 2.37 nao traz a ABI). Faz o epoll_wait sondar a NAPI
@@ -69,18 +71,40 @@ static void build_responses(void) {
 
 enum { T_CLIENT = 0, T_LISTEN = 1, T_CTRL = 2 };
 
-typedef struct {
+typedef struct conn_t {
     int fd;
     int type;
     int rlen, wlen, wsent;
+    struct conn_t *next; // free-list
     unsigned char rbuf[BUFSZ];
     unsigned char wbuf[BUFSZ];
 } conn_t;
 
+// Pool por worker (thread-local): reusa conn_t e evita calloc + page-faults por
+// conexao no caminho quente, reduzindo a cauda de latencia.
+static __thread conn_t *g_free = NULL;
+
 static conn_t *new_conn(int fd, int type) {
-    conn_t *c = calloc(1, sizeof(conn_t));
-    c->fd = fd; c->type = type;
+    conn_t *c = g_free;
+    if (c) g_free = c->next;
+    else c = malloc(sizeof(conn_t));
+    c->fd = fd; c->type = type; c->rlen = c->wlen = c->wsent = 0;
     return c;
+}
+
+static void release_conn(conn_t *c) {
+    c->next = g_free;
+    g_free = c;
+}
+
+// Pre-aloca e toca N conn_t (page-in antecipado) no startup do worker.
+static void warm_pool(int n) {
+    for (int i = 0; i < n; i++) {
+        conn_t *c = malloc(sizeof(conn_t));
+        if (!c) break;
+        c->rbuf[0] = 0; c->wbuf[0] = 0; c->rbuf[BUFSZ - 1] = 0; c->wbuf[BUFSZ - 1] = 0;
+        release_conn(c);
+    }
 }
 
 static int content_length(const unsigned char *b, int hdr_end) {
@@ -142,7 +166,7 @@ static void process(conn_t *c, const index_t *ix, int32_t *scratch) {
 static void close_conn(int ep, conn_t *c) {
     epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
-    free(c);
+    release_conn(c);
 }
 
 static int flush(conn_t *c) {
@@ -179,6 +203,13 @@ static int recv_fd(int ctrl) {
 }
 
 static int g_busy_poll_us = 0;
+static int g_epoll_idle_us = 0; // keep-warm: spin com epoll timeout=0 por ate Nus apos o ultimo evento
+
+static inline uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 static void enable_busy_poll(int ep) {
     if (g_busy_poll_us <= 0) return;
@@ -223,6 +254,26 @@ static void handle_client(int ep, conn_t *c, uint32_t e, const index_t *ix, int3
     }
 }
 
+// epoll_wait com keep-warm: enquanto houve evento ha menos de idle_us, faz poll
+// nao-bloqueante (timeout=0) para pegar o proximo request sem latencia de wakeup
+// (independe de busy-poll da NIC); se ocioso, bloqueia (economiza a quota de CPU).
+static int kw_wait(int ep, struct epoll_event *events, uint64_t *last) {
+    if (g_epoll_idle_us <= 0) return epoll_wait(ep, events, MAX_EVENTS, -1);
+    uint64_t idle_ns = (uint64_t)g_epoll_idle_us * 1000;
+    for (;;) {
+        int n = epoll_wait(ep, events, MAX_EVENTS, 0);
+        if (n != 0) { *last = now_ns(); return n; }
+        if (now_ns() - *last >= idle_ns) {
+            n = epoll_wait(ep, events, MAX_EVENTS, -1);  // ocioso: bloqueia (economiza CPU)
+            *last = now_ns();
+            return n;
+        }
+        // Pausa curta em userspace entre polls: reduz a taxa de syscall ~100x
+        // (nao martela o kernel) mantendo granularidade de wakeup de poucos us.
+        for (int s = 0; s < 96; s++) __builtin_ia32_pause();
+    }
+}
+
 // Worker do modo Unix: aceita a conexao de controle do LB e recebe fds prontos.
 static void *unix_worker(void *arg) {
     const char *path = (const char *)arg;
@@ -240,10 +291,13 @@ static void *unix_worker(void *arg) {
     epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &lev);
 
     int32_t *scratch = malloc((size_t)g_ix.max_lanes * sizeof(int32_t));
+    warm_pool(512);
+    prctl(PR_SET_TIMERSLACK, 1UL); // slack minimo: wakeups mais precisos
     struct epoll_event events[MAX_EVENTS];
+    uint64_t last_event = now_ns();
 
     for (;;) {
-        int n = epoll_wait(ep, events, MAX_EVENTS, -1);
+        int n = kw_wait(ep, events, &last_event);
         for (int i = 0; i < n; i++) {
             conn_t *c = (conn_t *)events[i].data.ptr;
             if (c->type == T_LISTEN) {
@@ -287,6 +341,8 @@ static void *tcp_worker(void *arg) {
     epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &lev);
 
     int32_t *scratch = malloc((size_t)g_ix.max_lanes * sizeof(int32_t));
+    warm_pool(512);
+    prctl(PR_SET_TIMERSLACK, 1UL); // slack minimo: wakeups mais precisos
     struct epoll_event events[MAX_EVENTS];
     for (;;) {
         int n = epoll_wait(ep, events, MAX_EVENTS, -1);
@@ -319,6 +375,7 @@ int main(void) {
     g_port = env_int("PORT", 8080);
     g_workers = env_int("WORKERS", 2);
     g_busy_poll_us = env_int("RINHA_C_BUSY_POLL_US", 0);
+    g_epoll_idle_us = env_int("RINHA_C_EPOLL_IDLE_US", 0);
     if (g_workers > 64) g_workers = 64;
 
     if (index_load(idx, &g_ix) != 0) return 1;
